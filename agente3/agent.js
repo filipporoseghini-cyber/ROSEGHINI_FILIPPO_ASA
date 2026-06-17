@@ -1,38 +1,13 @@
 /* ============================================================================
-   FILE: agent.js  (versione BDI - agente3)
-   ARCHITETTURA: BDI (Belief-Desire-Intention) con pianificazione A*
+   agent.js — Agent A: BDI architecture with A* navigation and PDDL planning.
 
-   COS'È L'ARCHITETTURA BDI?
-   BDI è un modello teorico per agenti intelligenti, composto da tre elementi:
+   Execution cycle:
+     onSensing → optionsGeneration() → IntentionRevisionReplace.push(predicate)
+               → Intention.achieve() → Plan.execute()
 
-   - BELIEFS (Credenze): ciò che l'agente SA sul mondo. Sono gestite in beliefs.js.
-     Esempio: "il pacco P è in posizione (3,5)" oppure "la casella (2,2) è un muro".
-
-   - DESIRES (Desideri) / OPTIONS: ciò che l'agente VORREBBE fare, generato
-     dalla funzione optionsGeneration(). Non tutte le opzioni diventano intenzioni.
-     Esempio: "vorrei raccogliere il pacco P", "vorrei consegnare i pacchi".
-
-   - INTENTIONS (Intenzioni): l'obiettivo che l'agente ha DECISO di perseguire
-     in questo momento. Viene eseguito da un piano concreto scelto dalla libreria.
-     Esempio: l'agente ha DECISO di raccogliere P e sta eseguendo il piano GoPickUp.
-
-   FLUSSO DI ESECUZIONE:
-   1. socket.onSensing() → aggiorna le Beliefs e chiama optionsGeneration()
-   2. optionsGeneration() → calcola l'utilità di ogni opzione e sceglie la migliore,
-      poi la "spinge" nell'agente tramite myAgent.push(predicate)
-   3. IntentionRevisionReplace.push() → se il nuovo obiettivo è diverso da quello
-      corrente, interrompe il piano in corso e avvia il nuovo
-   4. Intention.achieve() → scorre la Plan Library finché trova un piano applicabile
-   5. Piano.execute() → esegue le azioni concrete (emitMove, emitPickup, ecc.)
-      usando il Planner A* per navigare
-
-   DIFFERENZE RISPETTO ALLA VERSIONE FSM (agente2):
-   - Rimosso il Watchdog (sostituito dal meccanismo stop/fail delle Intentions)
-   - Rimossa la Congestion Map (semplificazione: impatto minimo sull'efficienza)
-   - Aggiunta struttura BDI formale: Intention, IntentionRevision, Plan Library
-   - L'inerzia decisionale è ora implicita: se il target non cambia, il piano
-     non viene interrotto (IntentionRevisionReplace.push non fa nulla se il
-     predicato è identico a quello già in esecuzione)
+   Inertia: if optionsGeneration pushes the same predicate as the current
+   intention, IntentionRevisionReplace is a no-op — the running plan is never
+   interrupted needlessly (BDI commitment semantics).
 ============================================================================ */
 
 import 'dotenv/config';
@@ -40,98 +15,122 @@ import { DjsConnect } from "@unitn-asa/deliveroo-js-sdk";
 import { Beliefs } from "./beliefs.js";
 import { Planner } from "./planner.js";
 import { PddlPlanner } from "./pddlPlanner.js";
+import { PddlDeliveryPlanner } from "./pddlDelivery.js";
+import { PddlCratePlanner } from "./pddlCrates.js";
 
-/* ============================================================================
-   SEZIONE 1: SETUP GLOBALE
-   Variabili e strutture dati condivise da tutto il file.
-============================================================================ */
-
-/* ----------------------------------------------------------------------------
-   FLAG: PLANNER ESTERNO PDDL vs A* LOCALE
-   -------------------------------------------------------------------------
-   Le slide del corso (2 e 9) richiedono un "external planner component".
-   Questo flag sceglie QUALE planner usa AStarMove per la navigazione:
-     - true  → planner PDDL (pddlPlanner.js): genera dominio+problema STRIPS e
-               interroga un solver online (planning-as-a-service). È la modalità
-               da mostrare all'esame per dimostrare la competenza PDDL.
-               Se il solver fallisce / la mappa è troppo grande, ricade
-               AUTOMATICAMENTE sull'A* (nessun blocco di gioco).
-     - false → A* locale (planner.js): veloce, deterministico, default per il
-               gameplay reale.
-   Si può attivare anche da variabile d'ambiente: USE_PDDL_PLANNER=true.
----------------------------------------------------------------------------- */
+// ── USE_PDDL_PLANNER: when true, AStarMove delegates navigation to the online
+// PDDL solver (pddlPlanner.js) instead of the local A*. Falls back to A*
+// automatically if the solver is unreachable or returns no plan.
 const USE_PDDL_PLANNER = String(process.env.USE_PDDL_PLANNER).toLowerCase() === 'true';
 
-// Sistema di credenze dell'agente (beliefs.js).
+// ── USE_PDDL_DELIVERY: when true, PddlDeliveryPlan composes the full multi-
+// parcel trip (which parcels, in what order, which delivery zone) via the
+// online PDDL solver (pddlDelivery.js) — the means-end reasoning step.
+// Falls back to the greedy utility heuristic if the solver fails (see
+// pddlCooldownUntil). Distinct from USE_PDDL_PLANNER (navigation-only).
+const USE_PDDL_DELIVERY = String(process.env.USE_PDDL_DELIVERY).toLowerCase() === 'true';
+
 const myBeliefs = new Beliefs();
+const me = {}; // populated by socket.onYou on every tick
 
-// Dati sull'agente stesso: vengono aggiornati ad ogni evento 'onYou' del server.
-const me = {};
+let movementDurationMs = 50;  // self-calibrating EMA (α=0.3), converges in ~10 steps
+const EXPECTED_SPAWN_VALUE = 4;
+const MAX_CAPACITY = 18;
+const OPPORTUNISTIC_RADIUS = 5;    // max detour distance for en-route parcel pickup
+const SPAWN_COOLDOWN_MS = 15000;
+const BAN_DURATION_MS = 3000;      // short ban for unreachable targets
+const MAX_MOVE_FAILS = 5;          // consecutive rejected moves before abandoning goal
+const CONGESTION_PENALTY = 100;    // cost added to A* for recently rejected tiles
+const CONGESTION_DURATION_MS = 5000;
+let sensingRadius = parseInt(process.env.SENSING_RADIUS ?? '5');
+// Updated by socket.onConfig; the .env value is just the initial fallback.
 
-/* --------------------------------------------------------------------------
-   COSTANTI DI COMPORTAMENTO
-   Definiscono il "carattere" dell'agente: quanto è avido, quanto è paziente.
--------------------------------------------------------------------------- */
-let movementDurationMs = 50;  // Stima della durata di ogni passo in ms.
-// Si auto-calibra misurando il tempo reale delle mosse (EMA α=0.3).
-// Il valore converge al vero movement_duration del server in ~10 passi.
-const EXPECTED_SPAWN_VALUE = 4;    // Valore medio atteso di un pacco su una spawn zone
-const MAX_CAPACITY = 18;    // Numero massimo di pacchi trasportabili
-const OPPORTUNISTIC_RADIUS = 5;    // Raggio entro cui deviare per raccogliere un pacco
-// anche quando si sta andando a consegnare
-const SPAWN_COOLDOWN_MS = 15000; // Millisecondi di "cooldown" per una spawn visitata
-const BAN_DURATION_MS = 3000;  // Millisecondi di ban per obiettivi irraggiungibili
-const MAX_MOVE_FAILS = 5;      // Mosse consecutive rifiutate prima di abbandonare
-// un obiettivo (anti-stallo: evita di sbattere all'infinito contro un agente fermo)
-const CONGESTION_PENALTY = 100; // Penalità aggiunta al costo A* per tile bloccati
-const CONGESTION_DURATION_MS = 5000; // TTL di ogni voce nella congestion map
-const SENSING_RADIUS = parseInt(process.env.SENSING_RADIUS ?? '5'); // Raggio visivo in tile
-// (x_offset + y_offset < sensing_distance).
-// Deve corrispondere al parametro del server.
-// Configurabile in .env: SENSING_RADIUS=5
-
-/* --------------------------------------------------------------------------
-   MEMORIE TEMPORANEE GLOBALI
-   Strutture dati che persistono tra un ciclo di sensing e l'altro.
--------------------------------------------------------------------------- */
-
-// Blacklist: obiettivi temporaneamente esclusi perché irraggiungibili.
-// Format: ID/coordinate → timestamp di scadenza del ban
+// Short-lived bans for targets that proved unreachable.
 const blacklist = {
-    parcels: new Map(), // pacchi irraggiungibili
-    zones: new Map()  // zone di consegna irraggiungibili
+    parcels: new Map(), // id → expireAt
+    zones: new Map()    // "x,y" → expireAt
 };
 
-// Mappa di congestione: tile su cui una mossa è stata rifiutata dal server.
-// Format: "x,y" → { penalty: number, expireAt: timestamp }
-// Viene passata al planner A* per aumentare il costo di quei tile.
+// Tiles on which a move was recently rejected; passed to A* as extra cost.
+// Format: "x,y" → { penalty, expireAt }
 const congestionMap = new Map();
 
-// Memoria del pattugliamento: zone di spawn già visitate di recente.
-// Evita che l'agente continui a tornare sulle stesse caselle vuote.
+// Spawn zones visited recently (cooldown to avoid grinding the same cluster).
 const visitedSpawns = new Map();
 
-/* --------------------------------------------------------------------------
-   FUNZIONE DISTANZA MANHATTAN
-   Calcola il numero minimo di passi tra due punti su una griglia 4-connessa.
-   Usiamo Math.round() perché le coordinate possono avere piccoli valori decimali.
--------------------------------------------------------------------------- */
+// If the PDDL delivery solver fails or is unreachable, skip it for
+// PDDL_FAIL_COOLDOWN_MS and fall back to the greedy heuristic. Prevents
+// hammering a dead solver every deliberation cycle.
+let pddlCooldownUntil = 0;
+const PDDL_FAIL_COOLDOWN_MS = 30000;
+
+// Active Sokoban navigation goal. When the best reachable target requires
+// multi-push crate sequencing (A* returns null), optionsGeneration sets this
+// and pushes ['crate_nav', x, y]. It re-pushes the same predicate every tick
+// so IntentionRevisionReplace never interrupts the plan mid-execution.
+// CrateNavigate clears this on completion or failure.
+let crateNavGoal = null;             // { x, y } or null
+const crateNavBlacklist = new Map(); // "x,y" → expireAt for PDDL-unsolvable goals
+const CRATE_NAV_BAN_MS = 20000;
+let mapHasCrates = false;            // true only on maps that have '5!' tiles
+
+/* Coordination protocol with the LLM partner (Challenge 2 - Level 3).
+   The LLM is the orchestrator: it reads natural-language missions and sends
+   [COORD] commands via game-chat. When a coordination is active, it has top
+   priority and suspends normal gameplay. Commands:
+     [COORD] pos <x> <y>           — position exchange (beliefs sync)
+     [COORD] goto_wait <x> <y> <d> — move within dist d of (x,y) and wait
+     [COORD] freeze                — stop and wait (red light)
+     [COORD] release               — end coordination, resume normal play
+   BDI sends: [COORD] pos (periodic heartbeat) and [COORD] arrived (rendezvous).
+*/
+const coordState = { mode: null, x: 0, y: 0, dist: 0 };
+let partnerPos = null;           // last known position of the LLM partner
+let partnerId = null;            // used for closest-commits tie-breaking
+let lastCoordBroadcast = 0;
+const COORD_BROADCAST_MS = 2000;
+
+// Send to the LLM partner directly once its ID is known; shout only as fallback.
+function emitCoord(msg) {
+    if (partnerId) socket.emitSay(partnerId, msg);
+    else socket.emitShout(msg);
+}
+
+/* Team-wide mission constraints received from the LLM via [COORD] rules.
+   The BDI never parses free text — only this fixed tag. Each [COORD] rules
+   message is a complete snapshot (not a diff), so it self-corrects if a
+   message is dropped. */
+const teamConstraints = {
+    forbiddenTiles: new Set(),
+    deliverBatchSize: null,
+    bonusDeliveryTiles: new Set(),
+    zeroValueDeliveryTiles: new Set(),
+    maxParcelReward: null,
+};
+
+// Parcels the LLM partner dropped for us to fetch ([COORD] fetch), highest priority.
+const pendingFetch = [];  // { id, x, y, expiresAt }
+const FETCH_TTL_MS = 20000;
+
+
 function distance({ x: x1, y: y1 }, { x: x2, y: y2 }) {
     return Math.abs(Math.round(x1) - Math.round(x2)) + Math.abs(Math.round(y1) - Math.round(y2));
 }
 
-/* --------------------------------------------------------------------------
-   estimateRewardAtArrival(parcel, distSteps)
+/* Returns the tile reached by moving 'move' from 'pos'. Used to record the
+   blocked tile on a rejected move and to identify upcoming crate pushes. */
+function targetTileForMove(pos, move) {
+    let x = Math.round(pos.x), y = Math.round(pos.y);
+    if (move === 'right') x++;
+    else if (move === 'left') x--;
+    else if (move === 'up') y++;
+    else if (move === 'down') y--;
+    return { x, y };
+}
 
-   Stima il reward di un pacco al momento in cui l'agente vi arriverebbe,
-   tenendo conto di due componenti di decadimento:
-     1. Elapsed: tempo già trascorso dal momento dell'ultimo sensing (il pacco
-        sta decadendo anche mentre l'agente sta facendo altro).
-     2. Travel: tempo necessario a percorrere 'distSteps' passi fino al pacco.
-
-   Se il reward stimato è ≤ 0, il pacco sarà scaduto prima dell'arrivo
-   e non vale la pena inseguirlo.
--------------------------------------------------------------------------- */
+/* Estimates a parcel's reward when the agent would arrive, accounting for
+   decay already elapsed since lastSeen plus the travel time for distSteps.
+   Returns 0 if the parcel will have expired before arrival. */
 function estimateRewardAtArrival(parcel, distSteps) {
     const rate = myBeliefs.getDecayRatePerMs();
     const elapsed = Date.now() - (parcel.lastSeen ?? Date.now());
@@ -139,23 +138,68 @@ function estimateRewardAtArrival(parcel, distSteps) {
     return Math.max(0, parcel.reward - (elapsed + travel) * rate);
 }
 
-/* ============================================================================
-   SEZIONE 2: CONNESSIONE AL SERVER
-============================================================================ */
+/* Returns the walkable tile within Manhattan dist of (cx,cy) that is closest
+   to us. If we are already within range, returns our current position. */
+function coordTargetTile(cx, cy, dist) {
+    if (distance(me, { x: cx, y: cy }) <= dist) {
+        return { x: Math.round(me.x), y: Math.round(me.y) };
+    }
+    let best = null, bestD = Infinity;
+    for (const tile of myBeliefs.map.values()) {
+        if (String(tile.type) === '0') continue;
+        const tx = Math.round(tile.x), ty = Math.round(tile.y);
+        if (Math.abs(tx - cx) + Math.abs(ty - cy) > dist) continue;
+        const d = distance(me, { x: tx, y: ty });
+        if (d < bestD) { bestD = d; best = { x: tx, y: ty }; }
+    }
+    return best || { x: cx, y: cy };
+}
+
+/* Nearest walkable tile on an odd-numbered row (red-light/green-light mission). */
+function nearestOddRowTile() {
+    let best = null, bestD = Infinity;
+    for (const tile of myBeliefs.map.values()) {
+        if (String(tile.type) === '0') continue;
+        const ty = Math.round(tile.y);
+        if (ty % 2 === 0) continue;   // odd rows only
+        const tx = Math.round(tile.x);
+        const d = distance(me, { x: tx, y: ty });
+        if (d < bestD) { bestD = d; best = { x: tx, y: ty }; }
+    }
+    return best || { x: Math.round(me.x), y: Math.round(me.y) };
+}
+
+/* "Closest-commits" coordination: the parcel belongs to the partner if they
+   are strictly closer. Tie-break: lower id wins, so exactly one agent claims
+   it. If partner position is unknown, we don't filter (reservation protocol). */
+function partnerOwns(parcel) {
+    if (!partnerPos) return false;
+    const myDist = distance(me, parcel);
+    const partnerDist = Math.abs(Math.round(partnerPos.x) - Math.round(parcel.x))
+                      + Math.abs(Math.round(partnerPos.y) - Math.round(parcel.y));
+    if (partnerDist < myDist) return true;
+    if (partnerDist > myDist) return false;
+    return partnerId != null && String(partnerId) < String(me.id);  // tie-break: lower id wins
+}
 
 const socket = DjsConnect(process.env.HOST, process.env.TOKEN);
 
 socket.onConnect(() => {
-    console.log("[SYSTEM] Connesso. Architettura BDI con pianificazione A* attiva.");
+    console.log("[SYSTEM] Connected. BDI architecture with A* planning active.");
 });
 
-// Ricezione mappa statica: una sola volta all'avvio.
+socket.onConfig((config) => {
+    const obs = config?.GAME?.player?.observation_distance;
+    if (obs !== undefined) sensingRadius = obs;
+});
+
 socket.onMap((width, height, tiles) => {
     if (!tiles || typeof tiles[Symbol.iterator] !== 'function') return;
     myBeliefs.updateMap(tiles);
+    mapHasCrates = myBeliefs.crates.size > 0;
+    if (!mapHasCrates) console.log('[SYSTEM] No crates on this map: PDDL Sokoban disabled.');
 });
 
-// Aggiornamento posizione, punteggio e penalità ad ogni tick.
 socket.onYou((data) => {
     me.id = data.id;
     me.name = data.name;
@@ -163,98 +207,229 @@ socket.onYou((data) => {
     me.y = data.y;
     me.score = data.score;
 
-    // Rileva se il server ci ha assegnato una nuova penalità.
-    // 'penalty' è un numero ≤ 0: diminuisce ad ogni azione invalida.
-    // Il server disconnette automaticamente l'agente se scende sotto -1000.
     const prevPenalty = me.penalty ?? 0;
     me.penalty = data.penalty ?? 0;
-    const delta = prevPenalty - me.penalty; // positivo = penalità appena incassata
+    const delta = prevPenalty - me.penalty;
     if (delta > 0) {
-        console.warn(`[PENALTY] -${delta} pti | totale: ${me.penalty} | score: ${me.score}`);
+        console.warn(`[PENALTY] -${delta} pts | total: ${me.penalty} | score: ${me.score}`);
+    }
+
+    // Periodically broadcast our position to the LLM partner (throttled)
+    // for rendezvous coordination and closest-commits allocation.
+    const nowTs = Date.now();
+    if (me.x !== undefined && nowTs - lastCoordBroadcast > COORD_BROADCAST_MS) {
+        lastCoordBroadcast = nowTs;
+        emitCoord(`[COORD] pos ${Math.round(me.x)} ${Math.round(me.y)}`);
     }
 });
 
-// Ricezione messaggi di coordinazione (es. dall'Agente LLM)
 socket.on('msg', (id, name, msg, replyCallback) => {
-    console.log(`\n[MSG IN] Da ${name}: ${msg}`);
-    if (replyCallback) replyCallback('Messaggio ricevuto!');
-    
-    // Semplice logica di coordinazione: se l'LLM ci dice che sta andando 
-    // a prendere un pacco specifico, lo ignoriamo temporaneamente (blacklist).
+    console.log(`\n[MSG IN] From ${name}: ${msg}`);
+    if (replyCallback) replyCallback('Message received!');
+
+    if (msg.startsWith('[COORD]')) {
+        const p = msg.trim().split(/\s+/);
+        const cmd = p[1];
+        if (cmd === 'pos') {
+            partnerPos = { x: Math.round(+p[2]), y: Math.round(+p[3]) };
+            partnerId = id;
+        } else if (cmd === 'rendezvous') {
+            coordState.mode = 'rendezvous';
+            coordState.x = Math.round(+p[2]);
+            coordState.y = Math.round(+p[3]);
+            console.log(`[COORD] rendezvous → heading to (${coordState.x},${coordState.y})`);
+        } else if (cmd === 'goto_wait') {
+            const t = nearestOddRowTile();
+            coordState.mode = 'goto_wait';
+            coordState.x = t.x; coordState.y = t.y; coordState.dist = 0;
+            console.log(`[COORD] goto_wait → moving to odd row (${t.x},${t.y})`);
+        } else if (cmd === 'freeze') {
+            coordState.mode = 'freeze';
+            console.log('[COORD] freeze → stopping and waiting');
+        } else if (cmd === 'release') {
+            coordState.mode = null;
+            console.log('[COORD] release → resuming normal play');
+        } else if (cmd === 'rules') {
+            // Full snapshot of team-wide constraints — always overwrites the
+            // entire object (idempotent; self-corrects if a message was lost).
+            const parseSet = v => new Set(v ? v.split(';').filter(Boolean) : []);
+            const fields = Object.fromEntries(
+                p.slice(2).map(kv => kv.split('=')).filter(([k]) => k)
+            );
+            teamConstraints.forbiddenTiles = parseSet(fields.avoid);
+            teamConstraints.deliverBatchSize = fields.batch ? parseInt(fields.batch, 10) || null : null;
+            teamConstraints.bonusDeliveryTiles = parseSet(fields.bonus);
+            teamConstraints.zeroValueDeliveryTiles = parseSet(fields.zero);
+            teamConstraints.maxParcelReward = fields.maxreward ? parseInt(fields.maxreward, 10) || null : null;
+            teamConstraints.relayMode = fields.relay === 'true' || fields.relay === '1';
+            console.log(`[COORD] rules updated: ${msg}`);
+        } else if (cmd === 'fetch') {
+            const fid = p[2];
+            const fx = Math.round(+p[3]), fy = Math.round(+p[4]);
+            pendingFetch.push({ id: fid, x: fx, y: fy, expiresAt: Date.now() + FETCH_TTL_MS });
+            console.log(`[COORD] fetch → parcel ${fid} dropped at (${fx},${fy}), top priority`);
+        }
+        return;
+    }
+
+    // If the LLM announces it is heading for a specific parcel, blacklist it
+    // so we don't compete for the same target.
     const match = msg.match(/taking parcel\s+(\S+)/i);
     if (match && match[1]) {
-        const parcelId = match[1];
-        console.log(`[COORDINATION] Ignoro il pacco ${parcelId} per 10 secondi.`);
-        blacklist.parcels.set(parcelId, Date.now() + 10000);
+        console.log(`[COORDINATION] Ignoring parcel ${match[1]} for 10 s.`);
+        blacklist.parcels.set(match[1], Date.now() + 10000);
     }
 });
 
-/* ============================================================================
-   SEZIONE 3: GENERAZIONE DELLE OPZIONI (il layer "Desires" del BDI)
+/* ── OPTIONS GENERATION (the "Desires" layer of BDI) ─────────────────────────
+   Called every sensing tick. Produces the single best predicate to push into
+   IntentionRevisionReplace. Predicates: ['go_pick_up', x, y, id],
+   ['go_deliver', x, y], ['patrol', x, y], ['crate_nav', x, y], etc.
+*/
 
-   Questa funzione implementa il ragionamento strategico dell'agente.
-   Viene chiamata ad ogni ciclo di sensing e produce UN'opzione (il predicato
-   migliore) da spingere nell'IntentionRevision.
+/* Returns true if the target tile is reachable by A* (no multi-push needed). */
+function reachableByAStar(tx, ty) {
+    return Planner.getPath(
+        me, { x: tx, y: ty }, myBeliefs.map,
+        myBeliefs.getOtherAgentPositions(me.id), [], congestionMap,
+        myBeliefs.getCrateKeys(),
+        [{ x: Math.round(me.x), y: Math.round(me.y) }, ...myBeliefs.deliveryZones, ...myBeliefs.spawnZones]
+    ) !== null;
+}
 
-   Un PREDICATO è un Array che descrive un'azione in forma dichiarativa:
-     ['go_pick_up', x, y, id]  → "vai a raccogliere il pacco id in (x,y)"
-     ['go_deliver', x, y]      → "vai a consegnare i pacchi nella zona (x,y)"
-     ['patrol', x, y]          → "vai a pattugliare la zona spawn in (x,y)"
-============================================================================ */
+/* Push the chosen predicate, but if the goal tile is A*-unreachable (needs a
+   Sokoban multi-push sequence) delegate to CrateNavigate — unless that goal
+   is already in crateNavBlacklist (solver declared it unsolvable recently), in
+   which case let the normal plan fail and blacklist it, avoiding repeated solver
+   hammering. CrateNavigate only brings the agent to the tile; pickup/delivery
+   continue normally once the path is clear. */
+function chooseGoal(predicate) {
+    const tx = Math.round(predicate[1]), ty = Math.round(predicate[2]);
+    if (reachableByAStar(tx, ty)) { myAgent.push(predicate); return; }
+    // On maps without crates an A* failure is a real wall — don't invoke PDDL.
+    if (!mapHasCrates) { myAgent.push(predicate); return; }
+    const banned = (crateNavBlacklist.get(`${tx},${ty}`) || 0) > Date.now();
+    if (banned) { myAgent.push(predicate); return; }
+    crateNavGoal = { x: tx, y: ty };
+    myAgent.push(['crate_nav', tx, ty]);
+}
+
 function optionsGeneration() {
 
-    // Non deliberiamo se non abbiamo ancora ricevuto la nostra posizione.
-    if (me.x === undefined || me.y === undefined) return;
+    if (me.x === undefined || me.y === undefined) return; // position not yet available
 
     const now = Date.now();
 
-    /* -- Pulizia blacklist, memoria pattugliamento e congestion map scaduti -- */
-    for (const [id, exp] of blacklist.parcels.entries()) if (now > exp) blacklist.parcels.delete(id);
-    for (const [coord, exp] of blacklist.zones.entries()) if (now > exp) blacklist.zones.delete(coord);
-    for (const [coord, exp] of visitedSpawns.entries()) if (now > exp) visitedSpawns.delete(coord);
-    for (const [coord, data] of congestionMap.entries()) if (now > data.expireAt) congestionMap.delete(coord);
-
-    /* ---- RACCOLTA DATI ---- */
-
-    const pacchiDisponibili = myBeliefs.getAvailableParcels()
-        .filter(p => !blacklist.parcels.has(p.id));
-
-    const zoneConsegnaValide = myBeliefs.deliveryZones
-        .filter(z => !blacklist.zones.has(`${z.x},${z.y}`));
+    // Active coordination overrides normal gameplay until released.
+    if (coordState.mode === 'freeze') { myAgent.push(['coord_idle']); return; }
 
     const pacchiInMano = myBeliefs.getCarriedParcels(me.id);
     const carryCount = pacchiInMano.length;
     const isFull = carryCount >= MAX_CAPACITY;
     const hasParcels = carryCount > 0;
+    const isOverBatch = teamConstraints.deliverBatchSize && carryCount >= teamConstraints.deliverBatchSize;
 
-    /* ---- CALCOLO UTILITÀ: RACCOGLIERE UN PACCO ---- */
-    // Utilità = rewardStimato² / distanza
-    // Il reward stimato include il decadimento già accumulato dal momento
-    // dell'ultimo sensing + quello che maturerà durante il percorso verso il pacco.
-    // Se il pacco sarà già scaduto quando arriviamo, lo saltiamo del tutto.
+    const batchSatisfied = !teamConstraints.deliverBatchSize || carryCount >= teamConstraints.deliverBatchSize || isFull;
+    const forcedToDeliver = isFull || isOverBatch;
+
+    if (coordState.mode === 'goto_wait' && !batchSatisfied) {
+        myAgent.push(['coord_goto_wait', coordState.x, coordState.y, coordState.dist]);
+        return;
+    }
+
+    // In relay mode we meet the partner only when empty-handed; if carrying,
+    // deliver first. In normal mode, only forced delivery overrides rendezvous.
+    const shouldIgnoreRendezvous = teamConstraints.relayMode ? hasParcels : forcedToDeliver;
+    if (coordState.mode === 'rendezvous' && !shouldIgnoreRendezvous) {
+        myAgent.push(['coord_rendezvous', coordState.x, coordState.y]);
+        return;
+    }
+
+    // Handoff parcels have top priority, but if we are already ready to deliver
+    // we finish that first (avoids holding a full inventory indefinitely).
+    for (let i = pendingFetch.length - 1; i >= 0; i--) {
+        const pf = pendingFetch[i];
+        if (now > pf.expiresAt || pacchiInMano.some(p => p.id === pf.id) || blacklist.parcels.has(pf.id)) {
+            pendingFetch.splice(i, 1);
+        }
+    }
+    if (pendingFetch.length > 0 && !forcedToDeliver) {
+        const f = pendingFetch[0]; // keep the entry — don't shift, re-push same intent each tick
+        myAgent.push(['go_pick_up', f.x, f.y, f.id]);
+        return;
+    }
+
+    // Proximity delivery: if we are ≤4 tiles from a valid zone and carrying
+    // more than 2 parcels, deliver immediately even if a CrateNavigate was active.
+    if (hasParcels && carryCount > 2) {
+        const nearZone = myBeliefs.deliveryZones
+            .filter(z => !blacklist.zones.has(`${Math.round(z.x)},${Math.round(z.y)}`))
+            .filter(z => !teamConstraints.zeroValueDeliveryTiles.has(`${Math.round(z.x)},${Math.round(z.y)}`))
+            .find(z => distance(me, z) <= 4);
+        if (nearZone) {
+            crateNavGoal = null;
+            myAgent.push(['go_deliver', Math.round(nearZone.x), Math.round(nearZone.y)]);
+            return;
+        }
+    }
+
+    // CrateNavigate commit: re-push the same predicate every tick so
+    // IntentionRevisionReplace never interrupts the Sokoban plan mid-execution.
+    // We exit the commit when the goal is reached or the corridor opens naturally.
+    if (mapHasCrates && crateNavGoal) {
+        if (distance(me, crateNavGoal) === 0 || reachableByAStar(crateNavGoal.x, crateNavGoal.y)) {
+            crateNavGoal = null;   // reached or corridor now open → normal play
+        } else {
+            myAgent.push(['crate_nav', crateNavGoal.x, crateNavGoal.y]);
+            return;
+        }
+    }
+
+    // Evict expired entries from all TTL maps.
+    for (const [id, exp] of blacklist.parcels.entries()) if (now > exp) blacklist.parcels.delete(id);
+    for (const [coord, exp] of blacklist.zones.entries()) if (now > exp) blacklist.zones.delete(coord);
+    for (const [coord, exp] of visitedSpawns.entries()) if (now > exp) visitedSpawns.delete(coord);
+    for (const [coord, data] of congestionMap.entries()) if (now > data.expireAt) congestionMap.delete(coord);
+    for (const [coord, exp] of crateNavBlacklist.entries()) if (now > exp) crateNavBlacklist.delete(coord);
+
+    // In relay mode the BDI ignores map parcels — its only job is fetching and
+    // delivering handoff parcels from the LLM partner (via pendingFetch).
+    const pacchiDisponibili = teamConstraints.relayMode ? [] : myBeliefs.getAvailableParcels()
+        .filter(p => !blacklist.parcels.has(p.id))
+        .filter(p => !partnerOwns(p));
+
+    // "Zero value" zones are walkable but never targeted. Among valid zones,
+    // bonus tiles are always preferred over plain ones.
+    const zoneConsegnaValide = myBeliefs.deliveryZones
+        .filter(z => !blacklist.zones.has(`${z.x},${z.y}`))
+        .filter(z => !teamConstraints.zeroValueDeliveryTiles.has(`${Math.round(z.x)},${Math.round(z.y)}`));
+    const bonusZones = zoneConsegnaValide.filter(
+        z => teamConstraints.bonusDeliveryTiles.has(`${Math.round(z.x)},${Math.round(z.y)}`)
+    );
+    const deliveryCandidates = bonusZones.length > 0 ? bonusZones : zoneConsegnaValide;
+
+    // Utility = estimatedReward² / distance. Skip parcels that will have expired
+    // by the time we arrive (estimateRewardAtArrival returns 0).
     let bestParcel = null, maxPickupUtility = -1;
     for (const p of pacchiDisponibili) {
         const dist = Math.max(0.1, distance(me, p));
         const rewardAtArrival = estimateRewardAtArrival(p, dist);
         if (rewardAtArrival <= 0) continue;
+        if (teamConstraints.maxParcelReward && rewardAtArrival > teamConstraints.maxParcelReward) continue;
         const utility = Math.pow(rewardAtArrival, 2) / dist;
         if (utility > maxPickupUtility) { maxPickupUtility = utility; bestParcel = p; }
     }
 
-    /* ---- CALCOLO UTILITÀ: CONSEGNARE I PACCHI IN MANO ---- */
+    // Delivery utility = estimatedCarriedReward² / distance.
     let bestZone = null, maxDeliveryUtility = -1;
     if (hasParcels) {
-        // Valore attuale dei pacchi in mano: sottraiamo il decay già maturato
-        // dal momento dell'ultimo sensing a oggi (i pacchi decadono anche
-        // mentre l'agente si muove, non solo quando il server li aggiorna).
         const rate = myBeliefs.getDecayRatePerMs();
-        const now = Date.now();
         const currentCarriedReward = pacchiInMano.reduce((s, p) => {
             const elapsed = now - (p.lastSeen ?? now);
             return s + Math.max(0, p.reward - elapsed * rate);
         }, 0);
 
-        for (const z of zoneConsegnaValide) {
+        for (const z of deliveryCandidates) {
             const dist = Math.max(0.1, distance(me, z));
             const travelDecay = dist * movementDurationMs * rate;
             const expectedReward = Math.max(0.1, currentCarriedReward - travelDecay);
@@ -263,11 +438,9 @@ function optionsGeneration() {
         }
     }
 
-    /* ---- CALCOLO UTILITÀ: PATTUGLIARE UNA ZONA SPAWN ---- */
-    // Escludiamo le spawn già nel raggio visivo: i loro pacchi sono già in
-    // pacchiDisponibili, e se sono vuote non c'è nulla da scoprire andendoci.
-    // Escludiamo anche le zone visitate di recente (cooldown).
-    const notVisible = z => distance(me, z) > SENSING_RADIUS;
+    // Patrol utility: exclude spawn zones already in sensor range (their parcels
+    // are already visible) and recently visited ones (cooldown).
+    const notVisible = z => distance(me, z) > sensingRadius;
     let unvisited = myBeliefs.spawnZones.filter(z =>
         notVisible(z) && !visitedSpawns.has(`${Math.round(z.x)},${Math.round(z.y)}`)
     );
@@ -279,100 +452,105 @@ function optionsGeneration() {
     let bestPatrol = null, maxPatrolUtility = -1;
     if (!isFull && unvisited.length > 0) {
         for (const z of unvisited) {
-            const dist = distance(me, z); // sempre > SENSING_RADIUS >= 1, mai 0
+            const dist = distance(me, z); // always > sensingRadius ≥ 1, never 0
             const utility = Math.pow(EXPECTED_SPAWN_VALUE, 2) / dist;
             if (utility > maxPatrolUtility) { maxPatrolUtility = utility; bestPatrol = z; }
         }
     }
 
-    /* ---- SELEZIONE DELL'OPZIONE MIGLIORE ---- */
-    // Logica decisionale: la priorità dipende dal confronto tra le utilità.
-    //
-    // Caso 1: CONSEGNA FORZATA
-    //   Se le tasche sono piene, dobbiamo per forza consegnare.
-    if (isFull && bestZone) {
-        myAgent.push(['go_deliver', bestZone.x, bestZone.y]);
+    /* PDDL means-end routing: if USE_PDDL_DELIVERY is on and the solver is not
+       in cooldown, delegate the full multi-parcel trip to PddlDeliveryPlan.
+       Patrol stays greedy (PDDL adds no value for exploration).
+       ['pddl_trip'] is a constant predicate — IntentionRevisionReplace's inertia
+       suppresses duplicate pushes, so the solver is called once per trip, not
+       once per tick. If the solver fails, PddlDeliveryPlan sets pddlCooldownUntil
+       and throws; the next tick falls through to the greedy heuristic below.
+
+       Team rules bypass: when batch/bonus/zero-value/maxReward constraints are
+       active, the PDDL selectTargets() is unaware of them and would violate the
+       mission silently — stay on the greedy heuristic (already rule-aware above). */
+    const teamRulesActive = !!teamConstraints.deliverBatchSize
+        || teamConstraints.bonusDeliveryTiles.size > 0
+        || teamConstraints.zeroValueDeliveryTiles.size > 0
+        || !!teamConstraints.maxParcelReward;
+
+    const somethingToDeliver = (bestParcel !== null) || (hasParcels && bestZone !== null);
+    if (USE_PDDL_DELIVERY && !teamRulesActive && now > pddlCooldownUntil && somethingToDeliver) {
+        myAgent.push(['pddl_trip']);
         return;
     }
 
-    // Caso 2: CONSEGNA CONVENIENTE (con opportunismo)
-    //   Se consegnare è più utile che raccogliere, andiamo a consegnare.
-    //   Ma se c'è un pacco MOLTO vicino e non siamo pieni, lo raccogliamo prima.
-    if (hasParcels && bestZone && maxDeliveryUtility > maxPickupUtility) {
+    // Option selection — priority order:
+
+    // 1. FORCED DELIVERY: inventory full or batch target reached.
+    if ((isFull || isOverBatch) && bestZone) {
+        chooseGoal(['go_deliver', bestZone.x, bestZone.y]);
+        return;
+    }
+
+    // 2. DELIVERY (with opportunistic pickup): deliver wins on utility, but grab
+    //    a very close parcel first if we are not full. Skip if batch not yet met.
+    if (hasParcels && bestZone && maxDeliveryUtility > maxPickupUtility && batchSatisfied) {
         if (bestParcel && distance(me, bestParcel) <= OPPORTUNISTIC_RADIUS) {
-            myAgent.push(['go_pick_up', bestParcel.x, bestParcel.y, bestParcel.id]);
+            chooseGoal(['go_pick_up', bestParcel.x, bestParcel.y, bestParcel.id]);
         } else {
-            myAgent.push(['go_deliver', bestZone.x, bestZone.y]);
+            chooseGoal(['go_deliver', bestZone.x, bestZone.y]);
         }
         return;
     }
 
-    // Caso 3: RACCOLTA PACCO
-    //   Raccogliere è più utile che esplorare.
+    // 3. PICKUP: a parcel beats patrol on expected utility.
     if (bestParcel && maxPickupUtility >= maxPatrolUtility) {
-        myAgent.push(['go_pick_up', bestParcel.x, bestParcel.y, bestParcel.id]);
+        chooseGoal(['go_pick_up', bestParcel.x, bestParcel.y, bestParcel.id]);
         return;
     }
 
-    // Caso 4: PATTUGLIAMENTO
-    //   Nessun pacco visibile conveniente: esploriamo le zone spawn.
+    // 4. PATROL: no parcels in range worth chasing, explore spawn zones.
     if (bestPatrol) {
-        myAgent.push(['patrol', bestPatrol.x, bestPatrol.y]);
+        chooseGoal(['patrol', bestPatrol.x, bestPatrol.y]);
+        return;
+    }
+
+    // 5. FALLBACK (anti-deadlock): bestPatrol requires notVisible (dist > radius),
+    //    so on small maps with all spawns inside FOV it is always null. Without
+    //    this, the agent pushes no intention at all and freezes — even when a
+    //    cached PDDL recovery plan is ready. Push the nearest spawn so AStarMove
+    //    can trigger the Sokoban planner if needed.
+    if (myBeliefs.spawnZones.length > 0) {
+        const nearest = myBeliefs.spawnZones.reduce(
+            (best, z) => distance(me, z) < distance(me, best) ? z : best
+        );
+        chooseGoal(['patrol', nearest.x, nearest.y]);
     }
 }
 
-/* ============================================================================
-   CICLO DI SENSING
-   Ad ogni tick del server: aggiorniamo le Beliefs e rigeneriamo le opzioni.
-============================================================================ */
+/* ── SENSING LOOP ────────────────────────────────────────────────────────── */
 socket.onSensing(async (sensings) => {
     if (me.x === undefined || me.y === undefined) return;
-    myBeliefs.updateSensing(sensings, { x: me.x, y: me.y }, SENSING_RADIUS);
+    myBeliefs.updateSensing(sensings, { x: me.x, y: me.y }, sensingRadius);
     optionsGeneration();
 });
 
 /* ============================================================================
-   SEZIONE 4: INTENTION REVISION
-
-   Questa è la componente BDI che gestisce le Intenzioni nel tempo.
-
-   La classe base IntentionRevision definisce il loop principale: un ciclo
-   infinito che prende la prima intenzione dalla coda e la esegue.
-
-   IntentionRevisionReplace estende questa logica: ogni volta che arriva
-   una nuova intenzione DIVERSA da quella corrente, interrompe quella in corso
-   e la sostituisce immediatamente. Questo garantisce che l'agente reagisca
-   sempre all'opzione più aggiornata generata dai sensori.
+   INTENTION REVISION — BDI execution engine
 ============================================================================ */
 
 class IntentionRevision {
 
-    // La coda delle intenzioni. Con IntentionRevisionReplace sarà sempre
-    // lunga al massimo 1-2 elementi (la corrente + la nuova appena arrivata).
     #intention_queue = new Array();
     get intention_queue() { return this.#intention_queue; }
 
-    /* Il loop principale: gira all'infinito controllando la coda.
-       'setImmediate' cede il controllo all'event loop di Node.js tra un'iterazione
-       e l'altra, evitando di bloccare il thread mentre aspettiamo eventi. */
     async loop() {
         while (true) {
             if (this.intention_queue.length > 0) {
-
                 const intention = this.intention_queue[0];
-
-                // Eseguiamo l'intenzione. Se fallisce (piano non trovato, obiettivo
-                // irraggiungibile, ecc.) catturiamo l'errore e continuiamo.
                 await intention.achieve()
                     .catch(err => {
                         if (!String(err).includes('stopped'))
-                            console.log('[INTENTION] Fallita:', ...intention.predicate, '→', err);
+                            console.log('[INTENTION] failed:', ...intention.predicate, '→', err);
                     });
-
-                // Rimuoviamo l'intenzione completata (o fallita) dalla coda.
                 this.intention_queue.shift();
             }
-            // Cediamo il controllo al sistema prima della prossima iterazione.
             await new Promise(res => setImmediate(res));
         }
     }
@@ -381,101 +559,58 @@ class IntentionRevision {
 }
 
 /* --------------------------------------------------------------------------
-   IntentionRevisionReplace: quando arriva un nuovo obiettivo diverso da quello
-   corrente, ferma immediatamente il piano in esecuzione e lo sostituisce.
+   IntentionRevisionReplace: a new predicate that differs from the current one
+   immediately stops and replaces the running plan.
 
-   INERZIA IMPLICITA: se optionsGeneration() spinge lo stesso predicato
-   (stesso pacco, stessa zona) due volte di fila, il metodo push() si accorge
-   che è identico all'ultimo in coda e NON lo sostituisce → il piano corrente
-   continua indisturbato. Questo è il meccanismo di inerzia del BDI.
+   Implicit inertia: if optionsGeneration pushes the same predicate as what is
+   already running, push() detects the match and does nothing — the current plan
+   continues uninterrupted (BDI commitment semantics).
 -------------------------------------------------------------------------- */
 class IntentionRevisionReplace extends IntentionRevision {
 
     async push(predicate) {
 
-        // Recuperiamo l'ultima intenzione in coda (quella corrente o l'ultima accodata).
         const last = this.intention_queue.at(this.intention_queue.length - 1);
 
-        // Se il predicato è identico all'intenzione corrente, non facciamo nulla:
-        // il piano in corso sta già lavorando verso questo obiettivo.
-        // 'join(' ')' converte l'Array in una stringa per confronto semplice.
-        // Es.: ['go_pick_up', 3, 5, 'abc'] → "go_pick_up 3 5 abc"
         if (last && last.predicate.join(' ') === predicate.join(' ')) return;
 
-        // ----------------------------------------------------------------
-        // GUARDIA ANTI-LIVELOCK: patrol → patrol
-        //
-        // PROBLEMA (trashing/livelock):
-        //   optionsGeneration() viene chiamata ad ogni tick del server.
-        //   Durante il movimento verso una zona spawn, la posizione dell'agente
-        //   (me.x, me.y) oscilla leggermente perché il server interpola
-        //   l'animazione (movement_duration: 50ms). Questo fa sì che due spawn
-        //   vicine abbiano distanze che si alternano di qualche decimo ad ogni
-        //   tick, rendendo "la più vicina" diversa da un tick all'altro.
-        //
-        //   Risultato senza questo blocco:
-        //     tick 1: best spawn = (8, 6)  → push(['patrol', 8, 6])  → REPLACE patrol (10,12) → stop
-        //     tick 2: best spawn = (10,12) → push(['patrol', 10,12]) → REPLACE patrol (8,6)   → stop
-        //     tick 3: best spawn = (8, 6)  → push(['patrol', 8, 6])  → REPLACE patrol (10,12) → stop
-        //     ... all'infinito. L'AStarMove viene stoppato prima di compiere
-        //     anche un solo passo: l'agente non si muove mai.
-        //
-        // SOLUZIONE:
-        //   Se il piano corrente È già un patrol (verso qualsiasi destinazione),
-        //   ignoriamo le nuove proposte di patrol. Il patrol corrente completerà
-        //   il suo percorso naturalmente, oppure fallirà per motivi reali
-        //   (percorso bloccato), e solo allora optionsGeneration() sceglierà
-        //   la prossima spawn da visitare.
-        //
-        //   Le azioni ad alta priorità (go_pick_up, go_deliver) possono comunque
-        //   interrompere un patrol: il blocco si attiva SOLO per patrol → patrol.
-        // ----------------------------------------------------------------
+        // Anti-livelock guard: patrol → patrol replacement causes thrashing.
+        // During movement the server interpolates position, so two nearby spawns
+        // can alternate as "nearest" every tick, giving:
+        //   tick 1: patrol (8,6)   → replaces patrol (10,12) → stop
+        //   tick 2: patrol (10,12) → replaces patrol (8,6)   → stop  (forever)
+        // Fix: if a patrol is already running, ignore any new patrol push — the
+        // current one finishes or fails naturally, then optionsGeneration picks
+        // the next spawn. High-priority actions (go_pick_up, go_deliver) still
+        // interrupt a patrol: this guard fires only for patrol → patrol.
         if (last && last.predicate[0] === 'patrol' && predicate[0] === 'patrol') {
-            return; // Non interrompere un patrol in corso con un altro patrol
+            return;
         }
 
-        // Creiamo la nuova intenzione e la mettiamo in coda.
         const intention = new Intention(this, predicate);
         this.intention_queue.push(intention);
-
-        // Interrompiamo il piano corrente (se esiste).
-        // stop() propaga lo stop anche ai sub-piani e alle sub-intenzioni.
         if (last) last.stop();
     }
 }
 
-/* ============================================================================
-   SEZIONE 5: INTENTION
-
-   Un'Intention rappresenta UN obiettivo da raggiungere.
-   Contiene il predicato (cosa vogliamo fare) e si occupa di trovare
-   un Piano applicabile nella Plan Library per raggiungerlo.
-============================================================================ */
+/* ── INTENTION ───────────────────────────────────────────────────────────── */
 
 class Intention {
 
-    // Indica se questa intenzione è stata fermata dall'esterno.
     #stopped = false;
     get stopped() { return this.#stopped; }
 
-    // Il piano correntemente in esecuzione per raggiungere questa intenzione.
     #current_plan = null;
-
-    // Il predicato che descrive l'obiettivo. Es.: ['go_pick_up', 3, 5, 'abc123']
     #predicate;
     get predicate() { return this.#predicate; }
-
-    // Riferimento al "genitore" (l'IntentionRevision o il Piano che ci ha creati).
-    // Serve per la catena di log.
     #parent;
+    #started = false;
 
     constructor(parent, predicate) {
         this.#parent = parent;
         this.#predicate = predicate;
     }
 
-    // Ferma questa intenzione E il piano in corso.
-    // Viene chiamato da IntentionRevisionReplace quando arriva un obiettivo migliore.
     stop() {
         this.#stopped = true;
         if (this.#current_plan) this.#current_plan.stop();
@@ -486,71 +621,45 @@ class Intention {
         else console.log(...args);
     }
 
-    // Flag per evitare di avviare la stessa intenzione due volte.
-    #started = false;
-
-    /* achieve() - Il cuore dell'Intention.
-       Scorre la Plan Library cercando un piano applicabile al nostro predicato.
-       Se il piano fallisce (eccezione), prova il successivo.
-       Se nessun piano funziona, l'intenzione fallisce lanciando un'eccezione. */
+    /* Scan the plan library for the first plan that handles this predicate.
+       On failure try the next. Throws if no plan succeeds. */
     async achieve() {
         if (this.#started) return this;
         this.#started = true;
 
         for (const PlanClass of planLibrary) {
-
-            // Se siamo stati fermati nel frattempo, usciamo subito.
             if (this.stopped) throw ['stopped', ...this.#predicate];
 
-            // isApplicableTo() verifica se questo piano sa gestire il nostro predicato.
             if (PlanClass.isApplicableTo(...this.#predicate)) {
-
-                // Istanziamo il piano (ogni esecuzione è un oggetto separato).
                 this.#current_plan = new PlanClass(this);
                 this.log('achieving', ...this.#predicate, 'with plan', PlanClass.name);
-
                 try {
-                    // Eseguiamo il piano e restituiamo il risultato se va a buon fine.
                     const result = await this.#current_plan.execute(...this.#predicate);
                     this.log('success', ...this.#predicate, 'plan', PlanClass.name);
                     return result;
                 } catch (error) {
-                    // Il piano è fallito: proviamo il prossimo nella libreria.
                     this.log('plan', PlanClass.name, 'failed with:', error);
                 }
             }
         }
 
-        // Nessun piano ha soddisfatto l'intenzione.
         throw ['no plan found for', ...this.#predicate];
     }
 }
 
-/* ============================================================================
-   SEZIONE 6: PLAN (classe base)
-
-   Un Piano è la sequenza concreta di azioni per raggiungere un obiettivo.
-   Ogni Piano specifico (GoPickUp, GoDeliver, ecc.) estende questa classe base
-   che fornisce:
-   - Il meccanismo di stop (propagato alle sub-intenzioni)
-   - Il metodo subIntention() per delegare a piani di livello inferiore
-     (es.: GoPickUp usa subIntention(['go_to', x, y]) per navigare)
-============================================================================ */
+/* ── PLAN (base class) ───────────────────────────────────────────────────── */
 
 class Plan {
 
     #stopped = false;
     get stopped() { return this.#stopped; }
-
-    // Lista delle sub-intenzioni attive, per propagare lo stop.
     #sub_intentions = [];
-
     #parent;
+
     constructor(parent) { this.#parent = parent; }
 
     stop() {
         this.#stopped = true;
-        // Propaghiamo lo stop a tutte le sub-intenzioni in corso.
         for (const i of this.#sub_intentions) i.stop();
     }
 
@@ -559,10 +668,6 @@ class Plan {
         else console.log(...args);
     }
 
-    /* subIntention() - Crea e avvia una sotto-intenzione.
-       Permette di comporre i piani in modo gerarchico.
-       Es.: GoPickUp chiama subIntention(['go_to', x, y]) che a sua volta
-       usa il piano AStarMove per navigare passo dopo passo. */
     async subIntention(predicate) {
         const sub = new Intention(this, predicate);
         this.#sub_intentions.push(sub);
@@ -570,22 +675,9 @@ class Plan {
     }
 }
 
-/* ============================================================================
-   SEZIONE 7: PLAN LIBRARY - I piani concreti dell'agente
+/* ── PLAN LIBRARY ────────────────────────────────────────────────────────── */
 
-   Ogni piano ha:
-   - isApplicableTo(...predicate): metodo STATICO che dice se il piano sa
-     gestire un dato predicato. Viene chiamato da Intention.achieve().
-   - execute(...predicate): metodo ASINCRONO che esegue le azioni concrete.
-     Può chiamare subIntention() per delegare sotto-obiettivi ad altri piani.
-============================================================================ */
-
-/* --------------------------------------------------------------------------
-   PIANO: GoPickUp
-   Obiettivo: raggiungere un pacco e raccoglierlo.
-   Strategia: delega la navigazione a subIntention(['go_to', x, y]),
-              poi emette il comando di raccolta.
--------------------------------------------------------------------------- */
+/* GoPickUp — navigate to a parcel and pick it up. */
 class GoPickUp extends Plan {
 
     static isApplicableTo(action) {
@@ -595,54 +687,39 @@ class GoPickUp extends Plan {
     async execute(action, x, y, id) {
         if (this.stopped) throw ['stopped'];
 
-        // Annuncia al partner LLM che il BDI sta andando per questo pacco,
-        // così l'LLM non si dirige verso lo stesso target contemporaneamente.
-        socket.emitShout(`[BDI] going_for ${id}`);
+        // Announce target so the LLM partner doesn't race us to the same parcel.
+        emitCoord(`[BDI] going_for ${id}`);
 
-        // Prima sotto-intenzione: raggiungere la casella del pacco.
-        // Sarà gestita dal piano AStarMove.
-        // Se la navigazione fallisce (es. un altro agente è fermo sulla casella
-        // del pacco e non possiamo entrarci, oppure il percorso è bloccato),
-        // mettiamo il pacco in blacklist per un breve periodo: così
-        // optionsGeneration() sceglie un altro obiettivo invece di rincorrere
-        // all'infinito questo pacco accumulando penalità. Dopo BAN_DURATION_MS
-        // il pacco torna selezionabile (l'altro agente potrebbe essersi spostato).
+        // Handoff parcels (from pendingFetch) are not blacklisted on nav failure —
+        // the LLM partner may still be standing on the tile and about to move off.
         try {
             await this.subIntention(['go_to', x, y]);
         } catch (err) {
             if (!String(err).includes('stopped')) {
-                blacklist.parcels.set(id, Date.now() + BAN_DURATION_MS);
+                const isHandoff = pendingFetch.some(pf => pf.id === id);
+                if (!isHandoff) blacklist.parcels.set(id, Date.now() + BAN_DURATION_MS);
             }
             throw err;
         }
 
         if (this.stopped) throw ['stopped'];
 
-        // Siamo sulla casella: raccogliamo i pacchi presenti.
         const picked = await socket.emitPickup();
 
         if (this.stopped) throw ['stopped'];
 
-        // Se la raccolta non ha prodotto nulla, il pacco potrebbe essere
-        // già stato preso da un altro agente. Lo banniamo per evitare
-        // di rincorrerlo di nuovo immediatamente.
         if (!picked || picked.length === 0) {
             blacklist.parcels.set(id, Date.now() + BAN_DURATION_MS);
             throw ['pickup failed - parcel gone', id];
         }
 
-        // Notifica l'agente LLM che questo pacco è già stato raccolto dal BDI,
-        // così l'LLM aggiorna le sue credenze e non ci si dirige inutilmente.
-        socket.emitShout(`[BDI] picked_up ${id}`);
+        emitCoord(`[BDI] picked_up ${id}`);
 
         return true;
     }
 }
 
-/* --------------------------------------------------------------------------
-   PIANO: GoDeliver
-   Obiettivo: raggiungere una zona di consegna e depositare i pacchi.
--------------------------------------------------------------------------- */
+/* GoDeliver — navigate to a delivery zone and put down all parcels. */
 class GoDeliver extends Plan {
 
     static isApplicableTo(action) {
@@ -652,32 +729,32 @@ class GoDeliver extends Plan {
     async execute(action, x, y) {
         if (this.stopped) throw ['stopped'];
 
-        // Navigazione verso la zona di consegna.
-        // Se il percorso non esiste, banniamo la zona per BAN_DURATION_MS
-        // così optionsGeneration() non la sceglie di nuovo immediatamente.
         try {
             await this.subIntention(['go_to', x, y]);
         } catch (err) {
-            if (!String(err).includes('stopped')) {
+            if (!String(err).includes('stopped'))
                 blacklist.zones.set(`${Math.round(x)},${Math.round(y)}`, Date.now() + BAN_DURATION_MS);
-            }
             throw err;
         }
 
         if (this.stopped) throw ['stopped'];
 
-        // Depositiamo tutti i pacchi in mano (nessun argomento = tutti).
+        // Safety guard: optionsGeneration already suppresses go_deliver until
+        // the batch is met, but this prevents an early delivery if the plan
+        // arrives here via an unexpected path in the future.
+        const batchN = teamConstraints.deliverBatchSize;
+        if (batchN && myBeliefs.getCarriedParcels(me.id).length < batchN) {
+            return true;
+        }
+
         await socket.emitPutdown();
 
         return true;
     }
 }
 
-/* --------------------------------------------------------------------------
-   PIANO: Patrol
-   Obiettivo: raggiungere una zona spawn per controllarla.
-   Dopo l'arrivo, registra la zona come "visitata" per SPAWN_COOLDOWN_MS.
--------------------------------------------------------------------------- */
+/* Patrol — move to a spawn zone, then mark it (and visible neighbours) as
+   visited for SPAWN_COOLDOWN_MS to avoid re-scanning the same cluster. */
 class Patrol extends Plan {
 
     static isApplicableTo(action) {
@@ -687,32 +764,235 @@ class Patrol extends Plan {
     async execute(action, x, y) {
         if (this.stopped) throw ['stopped'];
 
-        await this.subIntention(['go_to', x, y]);
+        // If the spawn is unreachable (e.g. corridor blocked by a crate), put it
+        // on a short cooldown instead of SPAWN_COOLDOWN_MS. A "no path" failure
+        // often means a PDDL crate recovery is still in progress (1–3 s), not
+        // that the zone is genuinely empty — we want to retry soon, not wait 15 s.
+        try {
+            await this.subIntention(['go_to', x, y]);
+        } catch (err) {
+            if (!String(err).includes('stopped'))
+                visitedSpawns.set(`${Math.round(x)},${Math.round(y)}`, Date.now() + BAN_DURATION_MS);
+            throw err;
+        }
 
-        // Registriamo la zona come visitata: optionsGeneration() la ignorerà
-        // per i prossimi SPAWN_COOLDOWN_MS millisecondi.
-        visitedSpawns.set(`${Math.round(x)},${Math.round(y)}`, Date.now() + SPAWN_COOLDOWN_MS);
+        // Mark ALL spawn zones within sensor range as visited, not just (x,y).
+        // Without this the agent crawls across adjacent spawns in the same cluster
+        // re-scanning the same area. Marking the whole visible region forces
+        // optionsGeneration to target a different region next.
+        const now = Date.now();
+        const center = { x: Math.round(me.x), y: Math.round(me.y) };
+        visitedSpawns.set(`${Math.round(x)},${Math.round(y)}`, now + SPAWN_COOLDOWN_MS);
+        for (const z of myBeliefs.spawnZones) {
+            if (distance(center, z) <= sensingRadius) {
+                visitedSpawns.set(`${Math.round(z.x)},${Math.round(z.y)}`, now + SPAWN_COOLDOWN_MS);
+            }
+        }
 
         return true;
     }
 }
 
-/* --------------------------------------------------------------------------
-   PIANO: AStarMove  (il piano di navigazione di basso livello)
-   Obiettivo: raggiungere la casella (x, y) usando l'algoritmo A*.
+/* PddlDeliveryPlan — means-end reasoning via external PDDL solver.
 
-   Questo è il piano che effettivamente muove l'agente nella mappa.
-   Funziona in un loop: ad ogni iterazione ricalcola il percorso ottimale
-   dalla posizione attuale al goal (tenendo conto delle casse mobili),
-   poi esegue il PRIMO passo di quel percorso.
+   Predicate: ['pddl_trip']. The PDDL solver composes the full multi-parcel
+   trip (which parcels, what order, which zone) on an abstract POI graph; the
+   A* (AStarMove) handles geometry at runtime, avoiding dynamic obstacles.
+   If the solver is unreachable or returns no plan, set pddlCooldownUntil and
+   fail — the next tick falls through to the greedy heuristic. Already-carried
+   parcels appear in the goal state so an interrupted trip is resumed correctly. */
+class PddlDeliveryPlan extends Plan {
 
-   Ricalcolare ad ogni passo (invece di eseguire tutto il percorso in una volta)
-   garantisce che l'agente si adatti a ostacoli dinamici (casse che si muovono,
-   altri agenti che bloccano il percorso pianificato).
+    static isApplicableTo(action) {
+        return action === 'pddl_trip';
+    }
 
-   Se il server rifiuta una mossa (result = false), il loop continua e
-   l'A* ricalcolerà un percorso alternativo al prossimo ciclo.
--------------------------------------------------------------------------- */
+    async execute() {
+        if (this.stopped) throw ['stopped'];
+
+        // Ephemeral merge of forbidden tiles into the congestion map (same
+        // pattern as AStarMove — avoids mutating the persistent congestionMap).
+        const pathCongestion = teamConstraints.forbiddenTiles.size === 0
+            ? congestionMap
+            : new Map([
+                ...congestionMap,
+                ...[...teamConstraints.forbiddenTiles].map(k => [k, { penalty: 100000, expireAt: Number.MAX_SAFE_INTEGER }]),
+            ]);
+
+        // Blacklisted parcels (unreachable or claimed by the LLM via "[LLM] taking")
+        // are excluded from the solver's goal state.
+        const result = await PddlDeliveryPlanner.plan(me, myBeliefs, {
+            congestionMap: pathCongestion,
+            excludeIds: new Set(blacklist.parcels.keys()),
+            movementDurationMs,
+        });
+
+        if (this.stopped) throw ['stopped'];
+
+        if (!result || result.steps.length === 0) {
+            pddlCooldownUntil = Date.now() + PDDL_FAIL_COOLDOWN_MS;
+            throw ['pddl: no plan (solver unreachable?) → greedy fallback'];
+        }
+
+        console.log(`[PDDL-TRIP] ${result.stats.planActions} actions: ${PddlDeliveryPlanner.formatSteps(result.steps)}`);
+
+        // Skip 'go' steps — each 'goto' in the PDDL plan targets the next
+        // action's tile, so navigating to it separately would double-move.
+        for (const step of result.steps) {
+            if (this.stopped) throw ['stopped'];
+
+            if (step.type === 'go') continue;
+
+            if (step.type === 'pickup') {
+                if (step.id) emitCoord(`[BDI] going_for ${step.id}`);
+                try {
+                    await this.subIntention(['go_to', step.x, step.y]);
+                } catch (err) {
+                    if (!String(err).includes('stopped') && step.id)
+                        blacklist.parcels.set(step.id, Date.now() + BAN_DURATION_MS);
+                    throw err; // i pacchi già in mano verranno consegnati al re-plan
+                }
+                if (this.stopped) throw ['stopped'];
+                const picked = await socket.emitPickup();
+                if (picked && picked.length > 0) {
+                    if (step.id) emitCoord(`[BDI] picked_up ${step.id}`);
+                } else if (step.id) {
+                    // Parcel gone before arrival: short ban, continue the trip.
+                    blacklist.parcels.set(step.id, Date.now() + BAN_DURATION_MS);
+                }
+
+            } else if (step.type === 'deliver') {
+                try {
+                    await this.subIntention(['go_to', step.x, step.y]);
+                } catch (err) {
+                    if (!String(err).includes('stopped'))
+                        blacklist.zones.set(`${Math.round(step.x)},${Math.round(step.y)}`, Date.now() + BAN_DURATION_MS);
+                    throw err;
+                }
+                if (this.stopped) throw ['stopped'];
+                await socket.emitPutdown();
+            }
+        }
+
+        return true;
+    }
+}
+
+/* CrateNavigate — Sokoban-style multi-push navigation via PDDL.
+
+   Invoked only when the best target requires pushing crates in sequence (A*
+   returns null). Complete crate knowledge (seeded from '5!' tiles at startup)
+   makes the solver reliable. The commit loop in optionsGeneration (re-pushing
+   the same predicate) prevents interruption mid-sequence.  isPlanSafe inside
+   PddlCratePlanner rejects any plan that disconnects spawn from delivery zones. */
+class CrateNavigate extends Plan {
+
+    static isApplicableTo(action) {
+        return action === 'crate_nav';
+    }
+
+    async execute(action, x, y) {
+        if (this.stopped) throw ['stopped'];
+        const goal = { x, y };
+        crateNavGoal = { x, y };   // keeps the optionsGeneration commit alive
+
+        const crateKeys = myBeliefs.getCrateKeys();
+        const agents = myBeliefs.getOtherAgentPositions(me.id);
+        console.log(`[CRATE-NAV] solving to (${x},${y}) with ${crateKeys.size} known crates...`);
+
+        let moves;
+        try {
+            moves = await PddlCratePlanner.getPath(
+                me, goal, myBeliefs.map, agents, crateKeys,
+                myBeliefs.deliveryZones, myBeliefs.spawnZones
+            );
+        } catch (err) {
+            crateNavGoal = null;
+            crateNavBlacklist.set(`${x},${y}`, Date.now() + CRATE_NAV_BAN_MS);
+            throw ['crate_nav solver error', x, y];
+        }
+
+        if (this.stopped) { crateNavGoal = null; throw ['stopped']; }
+
+        if (!moves || moves.length === 0) {
+            crateNavGoal = null;
+            crateNavBlacklist.set(`${x},${y}`, Date.now() + CRATE_NAV_BAN_MS);
+            // If the goal is a delivery zone, also blacklist it as a zone — otherwise
+            // chooseGoal keeps re-pushing it via A* (which also fails) for the entire
+            // PDDL ban window, wasting dozens of ticks on guaranteed failures.
+            if (myBeliefs.deliveryZones.some(z => Math.round(z.x) === x && Math.round(z.y) === y)) {
+                blacklist.zones.set(`${x},${y}`, Date.now() + CRATE_NAV_BAN_MS);
+                console.log(`[CRATE-NAV] delivery zone (${x},${y}) unreachable via PDDL → zone blacklist for ${CRATE_NAV_BAN_MS / 1000}s`);
+            }
+            throw ['crate_nav: no plan', x, y];
+        }
+
+        console.log(`[CRATE-NAV] plan of ${moves.length} moves: ${moves.join(' ')}`);
+
+        // Step-by-step execution. On a rejected move (stale beliefs / newly
+        // discovered crate), replan inline up to MAX_REPLANS times.
+        const MAX_REPLANS = 2;
+        let replanCount = 0;
+        let i = 0;
+        while (i < moves.length) {
+            if (this.stopped) { crateNavGoal = null; throw ['stopped']; }
+            const result = await socket.emitMove(moves[i]);
+            if (this.stopped) { crateNavGoal = null; throw ['stopped']; }
+            if (result) {
+                me.x = result.x;
+                me.y = result.y;
+                i++;
+            } else {
+                // Move rejected — beliefs updated mid-plan (e.g. newly visible crate).
+                // Replan from current position with fresh beliefs.
+                if (replanCount >= MAX_REPLANS) {
+                    console.log(`[CRATE-NAV] move ${moves[i]} rejected after ${replanCount} replans → giving up`);
+                    crateNavGoal = null;
+                    crateNavBlacklist.set(`${x},${y}`, Date.now() + CRATE_NAV_BAN_MS);
+                    if (myBeliefs.deliveryZones.some(z => Math.round(z.x) === x && Math.round(z.y) === y)) {
+                        blacklist.zones.set(`${x},${y}`, Date.now() + CRATE_NAV_BAN_MS);
+                        console.log(`[CRATE-NAV] delivery zone (${x},${y}) unreachable after replan → blacklist`);
+                    }
+                    throw ['crate_nav: no plan after rejection', x, y];
+                }
+                replanCount++;
+                console.log(`[CRATE-NAV] move ${moves[i]} rejected → replan #${replanCount} from (${Math.round(me.x)},${Math.round(me.y)})`);
+                let newMoves;
+                try {
+                    newMoves = await PddlCratePlanner.getPath(
+                        me, goal, myBeliefs.map,
+                        myBeliefs.getOtherAgentPositions(me.id),
+                        myBeliefs.getCrateKeys(),
+                        myBeliefs.deliveryZones, myBeliefs.spawnZones
+                    );
+                } catch (_) { newMoves = null; }
+                if (this.stopped) { crateNavGoal = null; throw ['stopped']; }
+                if (!newMoves || newMoves.length === 0) {
+                    console.log(`[CRATE-NAV] no alternative plan found → giving up`);
+                    crateNavGoal = null;
+                    crateNavBlacklist.set(`${x},${y}`, Date.now() + CRATE_NAV_BAN_MS);
+                    if (myBeliefs.deliveryZones.some(z => Math.round(z.x) === x && Math.round(z.y) === y)) {
+                        blacklist.zones.set(`${x},${y}`, Date.now() + CRATE_NAV_BAN_MS);
+                        console.log(`[CRATE-NAV] delivery zone (${x},${y}) unreachable → blacklist`);
+                    }
+                    throw ['crate_nav: no plan after rejection', x, y];
+                }
+                console.log(`[CRATE-NAV] new plan of ${newMoves.length} moves: ${newMoves.join(' ')}`);
+                moves = newMoves;
+                i = 0;
+            }
+        }
+
+        crateNavGoal = null;
+        console.log(`[CRATE-NAV] arrived at (${x},${y}).`);
+        return true;
+    }
+}
+
+/* AStarMove — low-level navigation plan.
+   Recalculates A* from current position every step so the agent adapts to
+   dynamic obstacles (moving crates, blocking agents). When USE_PDDL_PLANNER is
+   on, the external solver is used instead; A* is the automatic fallback. */
 class AStarMove extends Plan {
 
     static isApplicableTo(action) {
@@ -722,58 +1002,44 @@ class AStarMove extends Plan {
     async execute(action, x, y) {
         const goal = { x, y };
 
-        // ----------------------------------------------------------------
-        // CACHE DEL PIANO PDDL (usata solo in modalità USE_PDDL_PLANNER).
-        // -------------------------------------------------------------
-        // Il solver PDDL è online: una chiamata per OGNI passo sarebbe troppo
-        // lenta. Quindi, in modalità PDDL, calcoliamo il piano UNA VOLTA e lo
-        // seguiamo passo-passo; lo ricalcoliamo solo quando lo esauriamo o
-        // quando una mossa viene rifiutata (ambiente cambiato).
-        // In modalità A* questa cache resta inutilizzata (l'A* è locale e
-        // ricalcola ogni passo, gestendo nativamente le casse mobili).
-        let pddlPath = null;   // array di mosse ['right','up',...]
-        let pddlStep = 0;      // indice della prossima mossa nel piano cache
+        // PDDL plan cache (USE_PDDL_PLANNER mode only): the online solver is too
+        // slow to call every step, so we compute the plan once and follow it;
+        // recompute only when exhausted or a move is rejected. Unused in A* mode.
+        let pddlPath = null;
+        let pddlStep = 0;
 
-        // Contatore anti-stallo: quante mosse consecutive il server ha rifiutato.
-        // Se supera MAX_MOVE_FAILS, abbandoniamo l'obiettivo (qualcosa ci blocca
-        // stabilmente, es. un agente fermo) invece di insistere accumulando penalità.
         let consecutiveFails = 0;
 
-        // Loop finché non siamo arrivati alla destinazione.
-        // distance() > 0 significa che non siamo ancora sulla casella goal.
         while (distance(me, goal) > 0) {
 
-            // Controlliamo ad ogni iterazione se siamo stati fermati dall'esterno
-            // (IntentionRevisionReplace ha trovato un obiettivo migliore).
             if (this.stopped) throw ['stopped'];
 
-            // Aggiorniamo le posizioni delle casse ad ogni passo:
-            // le casse si muovono, quindi il percorso libero può cambiare!
             const crateKeys = myBeliefs.getCrateKeys();
 
-            // Zone critiche per il controllo di connettività sui push:
-            // includiamo la posizione attuale dell'agente (per non isolarsi)
-            // e tutte le delivery zones (per non precludersi la consegna).
+            // criticalZones includes both delivery zones and spawn zones: a push
+            // that disconnects us from spawns is just as stranding as one that
+            // blocks delivery — this was the root cause of an observed self-lock.
             const criticalZones = [
                 { x: Math.round(me.x), y: Math.round(me.y) },
-                ...myBeliefs.deliveryZones
+                ...myBeliefs.deliveryZones,
+                ...myBeliefs.spawnZones
             ];
 
             const agents = myBeliefs.getOtherAgentPositions(me.id);
 
-            // ----------------------------------------------------------------
-            // ANTI-STALLO: TILE-OBIETTIVO OCCUPATO DA UN ALTRO AGENTE
-            // -------------------------------------------------------------
-            // Caso tipico: un altro giocatore resta FERMO sulla casella di un
-            // pacco senza raccoglierlo. Quella casella è la nostra destinazione,
-            // ma non potremo MAI entrarci finché lui è lì. Se siamo già adiacenti
-            // (o sopra, distanza ≤ 1) e il tile è ancora occupato, abbandoniamo
-            // subito l'obiettivo: continuare significherebbe solo sbattere contro
-            // di lui e incassare penalità a ogni tentativo.
-            //
-            // Nota: NON abbandoniamo se siamo ancora lontani (distanza > 1): in
-            // quel caso continuiamo ad avvicinarci, dando all'altro agente il
-            // tempo di spostarsi prima del nostro arrivo.
+            // Ephemeral merge of forbidden tiles — avoids mutating the persistent
+            // congestionMap so removing a [COORD] rule leaves no stale state.
+            const pathCongestion = teamConstraints.forbiddenTiles.size === 0
+                ? congestionMap
+                : new Map([
+                    ...congestionMap,
+                    ...[...teamConstraints.forbiddenTiles].map(k => [k, { penalty: 100000, expireAt: Number.MAX_SAFE_INTEGER }]),
+                ]);
+
+            // If another agent is standing on the goal tile and we are adjacent,
+            // abandon — we can never enter while they are there, and retrying
+            // would just accumulate penalties. If we are still far away, keep
+            // approaching (they may move before we arrive).
             const goalOccupied = agents.some(
                 a => Math.round(a.x) === goal.x && Math.round(a.y) === goal.y
             );
@@ -781,98 +1047,64 @@ class AStarMove extends Plan {
                 throw ['goal occupied by agent', x, y];
             }
 
-            // 'move' = la singola mossa da eseguire in questa iterazione.
             let move;
 
             if (USE_PDDL_PLANNER) {
-                // ---- MODALITÀ PLANNER ESTERNO PDDL ----
-                // (Ri)calcoliamo il piano se non ne abbiamo uno o l'abbiamo finito.
+                // Compute/follow the PDDL plan; fall back to A* if solver fails.
                 if (!pddlPath || pddlStep >= pddlPath.length) {
                     pddlPath = await PddlPlanner.getPath(
                         me, goal, myBeliefs.map, agents, [], crateKeys
                     );
                     pddlStep = 0;
-
-                    // FALLBACK: se il solver PDDL fallisce (offline, timeout,
-                    // mappa troppo grande, nessun piano), usiamo l'A* locale.
                     if (!pddlPath) {
                         pddlPath = Planner.getPath(
-                            me, goal, myBeliefs.map, agents, [], congestionMap,
+                            me, goal, myBeliefs.map, agents, [], pathCongestion,
                             crateKeys, criticalZones
                         );
                     }
-
                     if (!pddlPath) throw ['no path to', x, y];
-                    if (pddlPath.length === 0) break; // già sul goal
+                    if (pddlPath.length === 0) break;
                 }
                 move = pddlPath[pddlStep];
 
             } else {
-                // ---- MODALITÀ A* LOCALE (default) ----
-                // Calcoliamo il percorso ottimale dalla posizione attuale al goal.
+                // A* mode (default): recompute every step so crate movements and
+                // agent positions are always reflected. If the goal is unreachable
+                // even with single-push crate moves, throw 'no path' and let
+                // optionsGeneration decide whether to delegate to CrateNavigate.
                 const path = Planner.getPath(
-                    me, goal, myBeliefs.map, agents, [], congestionMap,
+                    me, goal, myBeliefs.map, agents, [], pathCongestion,
                     crateKeys, criticalZones
                 );
-
-                // Se il percorso non esiste (goal bloccato o irraggiungibile),
-                // lanciamo un'eccezione che farà fallire il piano chiamante.
                 if (!path) throw ['no path to', x, y];
-
-                // path vuoto = siamo già sulla casella goal (distanza 0).
                 if (path.length === 0) break;
-
-                // Eseguiamo solo il PRIMO passo: al prossimo ciclo ricalcoleremo
-                // con la posizione aggiornata (gestione nativa delle casse mobili).
                 move = path[0];
             }
 
-            // Eseguiamo la mossa scelta dalla modalità attiva.
             const t0 = Date.now();
             const result = await socket.emitMove(move);
             const elapsed = Date.now() - t0;
 
             if (this.stopped) throw ['stopped'];
 
-            // Se il server ci ha confermato la mossa (result contiene {x, y}),
-            // aggiorniamo la nostra posizione locale e calibriamo movementDurationMs.
             if (result) {
                 me.x = result.x;
                 me.y = result.y;
-                // Aggiorniamo la stima con media mobile esponenziale (α=0.3).
-                // Converge al valore reale del server in ~10 passi, indipendentemente
-                // dalla configurazione della mappa.
+                // EMA (α=0.3) — converges to actual server step duration in ~10 steps.
                 movementDurationMs = 0.7 * movementDurationMs + 0.3 * elapsed;
-                // Avanziamo nel piano PDDL cache (ininfluente in modalità A*).
                 pddlStep++;
-                // Mossa riuscita: azzeriamo il contatore anti-stallo.
                 consecutiveFails = 0;
             } else {
-                // Mossa rifiutata: calcoliamo il tile che si è rivelato bloccato
-                // e lo registriamo nella congestion map con una penalità temporanea.
-                // Al prossimo ciclo A* aumenterà il costo di quel tile e cercherà
-                // un percorso alternativo.
-                let blockedX = Math.round(me.x);
-                let blockedY = Math.round(me.y);
-                if (move === 'right') blockedX++;
-                else if (move === 'left') blockedX--;
-                else if (move === 'up') blockedY++;
-                else if (move === 'down') blockedY--;
-
-                const blockedKey = `${blockedX},${blockedY}`;
+                // Move rejected: add a temporary cost to the blocked tile so A*
+                // finds an alternative route on the next iteration.
+                const blocked = targetTileForMove(me, move);
+                const blockedKey = `${blocked.x},${blocked.y}`;
                 const existing = congestionMap.get(blockedKey) || { penalty: 0 };
                 congestionMap.set(blockedKey, {
                     penalty: existing.penalty + CONGESTION_PENALTY,
                     expireAt: Date.now() + CONGESTION_DURATION_MS
                 });
-
-                // Invalidiamo il piano PDDL cache: l'ambiente è cambiato, va
-                // ricalcolato (in modalità A* questo è già implicito).
                 pddlPath = null;
-
-                // Anti-stallo generico: se accumuliamo troppe mosse rifiutate di
-                // fila, qualcosa ci blocca stabilmente (agente fermo, ingorgo).
-                // Abbandoniamo l'obiettivo così il ciclo BDI può ridecidere.
                 consecutiveFails++;
                 if (consecutiveFails >= MAX_MOVE_FAILS) {
                     throw ['stuck - too many rejected moves', x, y];
@@ -884,23 +1116,60 @@ class AStarMove extends Plan {
     }
 }
 
-/* ============================================================================
-   SEZIONE 8: PLAN LIBRARY e AVVIO DELL'AGENTE
+/* Coordination plans — activated by optionsGeneration when the LLM orchestrator
+   sets coordState. They take priority over normal play and run until coordState
+   changes, at which point optionsGeneration pushes a different predicate and
+   IntentionRevisionReplace stops the current plan. */
 
-   La planLibrary è l'elenco ORDINATO dei piani disponibili.
-   Intention.achieve() li scorre in ordine: il primo piano la cui
-   isApplicableTo() restituisce true viene istanziato ed eseguito.
+// Hold position until released or until the 90 s safety timeout fires
+// (guards against a crashed or message-dropping LLM partner).
+class CoordIdle extends Plan {
+    static isApplicableTo(action) { return action === 'coord_idle'; }
+    async execute() {
+        const MAX_ITER = 450;   // 450 × 200 ms = 90 s
+        for (let i = 0; i < MAX_ITER && !this.stopped; i++) {
+            await new Promise(res => setTimeout(res, 200));
+        }
+        if (!this.stopped) {
+            console.log('[COORD] CoordIdle timeout (90 s) — resuming normal play.');
+            coordState.mode = null;
+        }
+        return true;
+    }
+}
 
-   ORDINE IMPORTANTE:
-   - GoPickUp, GoDeliver, Patrol intercettano i predicati di alto livello
-   - AStarMove intercetta 'go_to', usato come sub-intenzione dagli altri piani
-============================================================================ */
-const planLibrary = [GoPickUp, GoDeliver, Patrol, AStarMove];
+// Move within 'dist' of (x,y), announce arrival, then wait (rendezvous).
+// 90 s safety timeout as above.
+class CoordGotoWait extends Plan {
+    static isApplicableTo(action) { return action === 'coord_goto_wait'; }
+    async execute(action, x, y, dist) {
+        if (this.stopped) throw ['stopped'];
+        const target = coordTargetTile(x, y, dist);
+        try {
+            await this.subIntention(['go_to', target.x, target.y]);
+        } catch (err) {
+            if (String(err).includes('stopped')) throw err;
+            // Path blocked — announce arrival anyway (best-effort rendezvous).
+        }
+        if (this.stopped) throw ['stopped'];
+        emitCoord('[COORD] arrived');
+        console.log('[COORD] arrived, waiting for partner / release.');
+        const MAX_ITER = 450;
+        for (let i = 0; i < MAX_ITER && !this.stopped; i++) {
+            await new Promise(res => setTimeout(res, 200));
+        }
+        if (!this.stopped) {
+            console.log('[COORD] CoordGotoWait timeout (90 s) — resuming normal play.');
+            coordState.mode = null;
+        }
+        return true;
+    }
+}
 
-// Creiamo l'agente con strategia di revisione "Replace":
-// ogni nuovo obiettivo migliore interrompe immediatamente quello corrente.
+// AStarMove must be last: it handles 'go_to', which is a sub-intention used
+// by all other plans. Coordination plans come before AStarMove but after
+// the gameplay plans so they can still call subIntention(['go_to', ...]).
+const planLibrary = [GoPickUp, GoDeliver, Patrol, PddlDeliveryPlan, CrateNavigate, CoordGotoWait, CoordIdle, AStarMove];
+
 const myAgent = new IntentionRevisionReplace();
-
-// Avviamo il loop infinito di esecuzione delle intenzioni.
-// Gira in background grazie a setImmediate (non blocca il thread).
 myAgent.loop();

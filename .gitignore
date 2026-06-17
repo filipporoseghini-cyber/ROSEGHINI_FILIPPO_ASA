@@ -1,2 +1,5 @@
+.env
 node_modules/
-.DS_Store
+agente3/tmp_*.mjs
+agente3/appunti/
+.claude/
